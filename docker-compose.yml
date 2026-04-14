@@ -1,0 +1,10 @@
+services:
+  mitmsqlproxy:
+    build: ./mitmsqlproxy
+    container_name: mitmsqlproxy
+    ports:
+      - "1433:1433"
+      - "212:212"
+    volumes:
+      - ./logs:/logs
+    restart: unless-stopped

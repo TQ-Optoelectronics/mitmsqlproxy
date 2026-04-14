@@ -66,7 +66,11 @@ class TDSPreLogin:
             self.data = self.data[:TDS_HEADER_SIZE+encryption_offset] + encryption.to_bytes(1, byteorder='big') + self.data[TDS_HEADER_SIZE+encryption_offset+1:]
 
     def getEncryptionOption(self):
-            return self.data[TDS_HEADER_SIZE+self.getEncryptionOptionOffset()]
+            try:
+                offset = self.getEncryptionOptionOffset()
+                return self.data[TDS_HEADER_SIZE+offset]
+            except (IndexError, struct.error):
+                return 0
 
     def getEncryptionOptionOffset(self):
         return self.getOptionOffset(TDS_PRELOGIN_OPTION_ENCRYPTION_TOKEN)
@@ -74,15 +78,16 @@ class TDSPreLogin:
 
     def getOptionOffset(self, option):
         option_ptr=0
-        while True:
+        max_len = len(self.data) - TDS_HEADER_SIZE
+        while option_ptr < max_len:
             if self.data[TDS_HEADER_SIZE+option_ptr] == TDS_PRELOGIN_OPTION_TERMINATOR_TOKEN:
                 break
             if self.data[TDS_HEADER_SIZE+option_ptr] == option:
                 break
             option_ptr=option_ptr+TDS_PRELOGIN_OPTION_SIZE
-        #print("End of options")
+        if option_ptr + 3 >= max_len:
+            return 0
         option_value_offset = self.data[TDS_HEADER_SIZE+option_ptr+1]*255+self.data[TDS_HEADER_SIZE+option_ptr+2]
-        #print("offset:",option_value_offset)
         return option_value_offset
 
 class TDS_SSPI_Token(Structure):
@@ -200,9 +205,22 @@ class MSSQLServerProtocol(protocol.Protocol):
             self.findSQLRegexp(data,query)
 
     def findSQLRegexp(self, data, regexp):
-        x = re.findall(regexp,data.decode('utf-16le', errors='ignore'))
-        if x:
-            LOG.warning("regexp: %s%s%s",RED,x[0],END)
+        try:
+            decoded = data.decode('utf-16le')
+        except:
+            decoded = data.decode('utf-16le', errors='ignore')
+        match = re.search(regexp, decoded)
+        if match:
+            start = match.start()
+            end_null = decoded.find('\x00\x00', start)
+            end = end_null if end_null > start else len(decoded)
+            # Stop at first parameter marker to avoid binary metadata
+            end_param = decoded.find('@P', start)
+            if end_param > start and end_param < end:
+                end = end_param
+            query_text = decoded[start:end].strip()
+            if query_text:
+                LOG.warning("SQL: %s", query_text)
 
 # from Responder  - Responder/servers/MSSQL.py
     def ParseSQLHash(self, data, Challenge):
@@ -454,6 +472,24 @@ class MSSQLServerProtocol(protocol.Protocol):
                 if self.client_encryption_req == tds.TDS_ENCRYPT_OFF or self.client_encryption_req == tds.TDS_ENCRYPT_NOT_SUP: 
                     preloginResponse.setEncryptionOption(tds.TDS_ENCRYPT_NOT_SUP)
                     data = preloginResponse.data
+            # Log response data for debugging
+            try:
+                # TDS uses UTF-16LE encoding - decode properly
+                decoded = data.decode('utf-16le', errors='ignore')
+                # Extract sequences of Chinese characters (real Chinese has non-null second byte)
+                # Match 3+ consecutive Chinese characters
+                chinese_pattern = re.compile(r'[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]{3,}')
+                for match in chinese_pattern.finditer(decoded):
+                    text = match.group().strip()
+                    if text:
+                        LOG.warning("RESP[中文]: %s", text)
+                # Also show sequences of ASCII words (filtering out interleaved nulls)
+                ascii_text = ''.join(c for c in decoded if c.isascii() or c.isspace())
+                for word in re.findall(r'[A-Za-z_][A-Za-z0-9_#@]{3,}', ascii_text):
+                    if word.lower() not in ('select', 'from', 'where', 'and', 'or', 'null'):
+                        LOG.warning("RESP[COL]: %s", word)
+            except:
+                pass
             self.transport.write(data)
 
 
@@ -606,14 +642,16 @@ class Config:
     findQuery = None
     findQueryRe = None
     logFile = None
+    skipServerCheck = False
 
 class CustomFormatter(logging.Formatter):
+    def __init__(self, fmt=None, datefmt=None):
+        super().__init__(fmt, datefmt)
+    
     def format(self, record):
         res = super(CustomFormatter, self).format(record)
-        # remove colors
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
         res = ansi_escape.sub('', res)
-        # remove windows encoding in passwords
         res = ''.join(c for c in res if c.isprintable())
         return res
 
@@ -669,6 +707,7 @@ def getArgs():
     group.add_argument('-lc', action='store',  help='loop connecting address (default 127.0.0.1)',metavar = "ip_address", default='127.0.0.1')
     group.add_argument('-lcp', action='store', help='loop connecting address port (default 2433)',metavar = "port", default='2433')
     group.add_argument('--disable-loop', action='store_true', help='disable internal loop - if both sides will negotiate encryption sniffing will be useless, only credentials will be shown on console (raw data only in debug mode)', dest="disableloop")
+    parser.add_argument('--skip-server-check', action='store_true', help='skip connectivity check to target server at startup (useful when server is unreachable during proxy startup)')
 
     group = parser.add_argument_group('TLS custom private key and certificate (by default it is dynamically generated)')
     group.add_argument('--cert', action='store', help='certificate file', metavar = "my.crt", default=None)
@@ -692,6 +731,7 @@ def getArgs():
     Config.findQuery=options.f
     Config.findQueryRe=options.r
     Config.logFile=options.log
+    Config.skipServerCheck=options.skip_server_check
 
     if options.key and options.cert:
         Config.certFromFile = True
@@ -734,15 +774,15 @@ def main():
 
     if Config.logFile:
         handler = logging.FileHandler(Config.logFile, "a")
-        formatter = logging.Formatter('%(asctime)s %(message)s')
-        handler.setFormatter(CustomFormatter(formatter._fmt))
+        formatter = CustomFormatter('%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        handler.setFormatter(formatter)
         LOG.addHandler(handler)
 
     show_banner()
 
     if Config.serverAddr == LOCAL_SERVER:
         Config.loop =False
-    else:
+    elif not Config.skipServerCheck:
         getServerEncryption()
 
     if Config.loop:
