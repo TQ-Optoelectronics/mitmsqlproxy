@@ -1,6 +1,6 @@
 services:
   mitmsqlproxy:
-    build: ./mitmsqlproxy
+    build: .
     container_name: mitmsqlproxy
     ports:
       - "1433:1433"
